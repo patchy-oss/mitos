@@ -501,9 +501,12 @@ pub mod tasks {
 Usage: Run with `cargo xtask <task>`, eg. `cargo xtask docgen`.
 
     Tasks:
-        install [--root <path>] [--profile <profile>]
-                                   Build and copy ms and its runtime into <root>/bin.
-                                   Defaults to the Cargo home and the release profile.
+        install [--root <path>] [--runtime-dir <path>] [--profile <profile>]
+                                   Build and install ms into <root>/bin and its runtime into
+                                   <runtime-dir>. <root> defaults to Cargo's install root
+                                   (CARGO_INSTALL_ROOT, Cargo config [install].root, CARGO_HOME,
+                                   or ~/.cargo); <runtime-dir> defaults to the user data runtime
+                                   directory (e.g. ~/.local/share/mitos/runtime).
         docgen                     Generate files to be included in the mdbook output.
         query-check [languages]    Check that tree-sitter queries are valid for the given
                                    languages, or all languages if none are specified.
