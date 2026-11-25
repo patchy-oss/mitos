@@ -5,8 +5,8 @@
 | `:quit`, `:q` | Close the current view. |
 | `:quit!`, `:q!` | Force close the current view, ignoring unsaved changes. |
 | `:open`, `:o`, `:edit`, `:e` | Open a file from disk into the current view. |
-| `:buffer-close`, `:bc`, `:bclose` | Close the current buffer. |
-| `:buffer-close!`, `:bc!`, `:bclose!` | Close the current buffer forcefully, ignoring unsaved changes. |
+| `:buffer-close`, `:bc`, `:bclose`, `:bd` | Close the current buffer. |
+| `:buffer-close!`, `:bc!`, `:bclose!`, `:bd!` | Close the current buffer forcefully, ignoring unsaved changes. |
 | `:buffer-close-others`, `:bco`, `:bcloseother` | Close all buffers but the currently focused one. |
 | `:buffer-close-others!`, `:bco!`, `:bcloseother!` | Force close all buffers but the currently focused one. |
 | `:buffer-close-all`, `:bca`, `:bcloseall` | Close all buffers without quitting. |

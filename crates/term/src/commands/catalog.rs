@@ -618,14 +618,14 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
     },
     TypableCommand {
         name: "buffer-close",
-        aliases: &["bc", "bclose"],
+        aliases: &["bc", "bclose", "bd"],
         doc: "Close the current buffer.",
         action: CommandAction::Committed(super::buffers::typed::buffer_close::<false>),
         args: CommandArgs::new(&[], &[]).rest(completers::buffer),
     },
     TypableCommand {
         name: "buffer-close!",
-        aliases: &["bc!", "bclose!"],
+        aliases: &["bc!", "bclose!", "bd!"],
         doc: "Close the current buffer forcefully, ignoring unsaved changes.",
         action: CommandAction::Committed(super::buffers::typed::buffer_close::<true>),
         args: CommandArgs::new(&[], &[]).rest(completers::buffer),
