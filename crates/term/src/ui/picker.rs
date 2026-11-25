@@ -316,6 +316,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     /// Whether to show the preview panel (default true)
     show_preview: bool,
+    picker_area: Option<Rect>,
     preview_area: Option<Rect>,
     /// Constraints for tabular formatting
     widths: Vec<Constraint>,
@@ -464,6 +465,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             query,
             truncate_start: true,
             show_preview: true,
+            picker_area: None,
             preview_area: None,
             callback_fn: Box::new(callback_fn),
             open_all_target: None,
@@ -532,6 +534,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub(crate) fn suspend(&mut self) {
         self.rendered_results = None;
         self.last_click = None;
+        self.picker_area = None;
         self.quicklist_task.cancel();
         self.query_options.needs_refresh |= self.query_options.pending.is_some()
             || (self.query_options.asynchronous.is_some() && self.results.is_refreshing())
@@ -736,6 +739,21 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             self.results.offset,
             u32::from(self.completion_height),
             len,
+            direction,
+        );
+    }
+
+    fn scroll_results(&mut self, amount: u32, direction: Direction) {
+        if self.completion_height == 0 {
+            return;
+        }
+        let len = self.results.matcher.snapshot().matched_item_count();
+        (self.results.cursor, self.results.offset) = scroll_position(
+            self.results.cursor,
+            self.results.offset,
+            u32::from(self.completion_height),
+            len,
+            amount,
             direction,
         );
     }
@@ -1863,7 +1881,8 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                 .pending_options
                 .as_ref()
                 .is_some_and(|pending| pending.matcher.active_injectors() == 0);
-        let (_, preview_area) = split_picker_area(area, render_preview);
+        let (picker_area, preview_area) = split_picker_area(area, render_preview);
+        self.picker_area = Some(picker_area);
         self.preview_area = preview_area;
         let inner = preview_area
             .map(|area| {
@@ -1902,6 +1921,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
         let render_preview = self.preview_visible(area);
         let (picker_area, preview_area) = split_picker_area(area, render_preview);
+        self.picker_area = Some(picker_area);
         self.preview_area = preview_area;
         self.render_picker(picker_area, surface, cx);
 
@@ -1930,6 +1950,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             Event::Resize(..) => {
                 self.rendered_results = None;
                 self.last_click = None;
+                self.picker_area = None;
                 self.preview_area = None;
                 return EventResult::Consumed(None);
             }
@@ -1952,6 +1973,23 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     if let Some(action) = action {
                         self.rendered_results = None;
                         return self.execute_actions(&[action], ctx);
+                    }
+                } else if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                ) {
+                    self.last_click = None;
+                    if self.picker_area.is_some_and(|area| area.contains(position)) {
+                        let direction = match mouse.kind {
+                            MouseEventKind::ScrollUp => Direction::Backward,
+                            MouseEventKind::ScrollDown => Direction::Forward,
+                            _ => unreachable!(),
+                        };
+                        let lines =
+                            u32::try_from(ctx.editor.config().scroll.wheel_lines.unsigned_abs())
+                                .unwrap_or(u32::MAX);
+                        self.rendered_results = None;
+                        self.scroll_results(lines, direction);
                     }
                 } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                     if let Some((area, first)) = self.rendered_results
@@ -2117,9 +2155,40 @@ fn page_position(
     (offset + row, offset)
 }
 
+/// Cursor and offset after viewport scrolling, as `(cursor, offset)`.
+///
+/// The viewport moves by `amount` rows within `[0, len.saturating_sub(rows)]`
+/// without wrapping, and the cursor is clamped into the resulting viewport so
+/// it stays visible.
+fn scroll_position(
+    cursor: u32,
+    offset: u32,
+    rows: u32,
+    len: u32,
+    amount: u32,
+    direction: Direction,
+) -> (u32, u32) {
+    if len == 0 || amount == 0 {
+        return (cursor, offset);
+    }
+    let rows = rows.max(1);
+    let cursor = cursor.min(len - 1);
+    let offset = visible_offset(cursor, offset, rows, len);
+    let last_page = len.saturating_sub(rows);
+    let offset = match direction {
+        Direction::Forward => offset.saturating_add(amount).min(last_page),
+        Direction::Backward => offset.saturating_sub(amount),
+    };
+    let cursor = cursor.clamp(offset, offset.saturating_add(rows - 1).min(len - 1));
+    (cursor, offset)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{page_position, split_picker_area, visible_column_widths, visible_offset, Column};
+    use super::{
+        page_position, scroll_position, split_picker_area, visible_column_widths, visible_offset,
+        Column,
+    };
     use crate::ui::image::image_preview_layout;
     use editor_core::movement::Direction::{Backward, Forward};
     use tui::layout::{Constraint, Size};
@@ -2499,6 +2568,150 @@ mod tests {
         event_with_config(&mut picker, &mut app, &config, click);
         assert_eq!(accepted.get(), Some(3));
         assert!(picker.prompt.line().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scrolling_moves_viewport_without_wrapping_and_keeps_cursor_visible() {
+        // Scrolling from the top moves viewport and pulls cursor down into view.
+        assert_eq!(scroll_position(0, 0, 10, 50, 3, Forward), (3, 3));
+        assert_eq!(scroll_position(3, 3, 10, 50, 3, Forward), (6, 6));
+        // Mid-viewport cursor stays on the same item until it leaves the viewport.
+        assert_eq!(scroll_position(12, 6, 10, 50, 3, Forward), (12, 9));
+        assert_eq!(scroll_position(12, 9, 10, 50, 3, Forward), (12, 12));
+        assert_eq!(scroll_position(12, 12, 10, 50, 3, Forward), (15, 15));
+        // Scrolling up clamps a bottom-edge cursor into view and stops at 0.
+        assert_eq!(scroll_position(24, 15, 10, 50, 3, Backward), (21, 12));
+        assert_eq!(scroll_position(2, 2, 10, 50, 5, Backward), (2, 0));
+        assert_eq!(scroll_position(0, 0, 10, 50, 3, Backward), (0, 0));
+        // Clamps cleanly at the bottom without wrapping.
+        assert_eq!(scroll_position(45, 39, 10, 50, 5, Forward), (45, 40));
+        assert_eq!(scroll_position(45, 40, 10, 50, 5, Forward), (45, 40));
+        // Short lists and empty/zero-step calls do not move.
+        assert_eq!(scroll_position(2, 0, 10, 5, 3, Forward), (2, 0));
+        assert_eq!(scroll_position(2, 0, 10, 5, 3, Backward), (2, 0));
+        assert_eq!(scroll_position(0, 0, 10, 0, 3, Forward), (0, 0));
+        assert_eq!(scroll_position(4, 2, 10, 50, 0, Forward), (4, 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mouse_scroll_in_picker_area_scrolls_results_and_resets_click() -> anyhow::Result<()> {
+        use super::{test::*, *};
+        use std::{cell::Cell, rc::Rc};
+        use ui_core::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = application(false)?;
+        let config = crate::config::Config::default();
+        let accepted = Rc::new(Cell::new(None));
+        let recorded = accepted.clone();
+        let mut picker = Picker::new(
+            app.editor.redraw().clone(),
+            [Column::new("name", |item: &u32, _| {
+                format!("entry-{item:02}").into()
+            })],
+            0,
+            0..40,
+            (),
+            move |_, item, _| recorded.set(Some(*item)),
+        );
+        until(&mut picker, &mut app, |picker| items(picker).count() == 40).await?;
+
+        let area = Rect::new(4, 2, 40, 10);
+        frame_with_area(&mut picker, &mut app, &config, area);
+        assert_eq!(picker.results.offset, 0);
+        assert_eq!(picker.selection(), Some(&0));
+
+        let scroll = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        // Scrolling outside the picker area is ignored.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(MouseEventKind::ScrollDown, 0, 0),
+        );
+        assert_eq!(picker.results.offset, 0);
+
+        // Consecutive scroll-down events inside the picker area accumulate without needing a redraw between them.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(MouseEventKind::ScrollDown, area.x + 5, area.y + 5),
+        );
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(MouseEventKind::ScrollDown, area.x + 5, area.y + 5),
+        );
+        assert_eq!(picker.results.offset, 6);
+        assert_eq!(picker.selection(), Some(&6));
+
+        // Redrawing renders the scrolled rows; clicking a row selects the scrolled item.
+        let surface = frame_with_area(&mut picker, &mut app, &config, area);
+        let row_of = |label: &str| {
+            (area.top()..area.bottom())
+                .find(|&row| {
+                    (area.left()..area.right())
+                        .map(|column| surface[(column, row)].symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .unwrap()
+        };
+        let row_eight = row_of("entry-08");
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 5,
+                row_eight,
+            ),
+        );
+        assert_eq!(picker.selection(), Some(&8));
+
+        // Scrolling up keeps the mid-viewport selection on entry-08 and clears the pending click.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(MouseEventKind::ScrollUp, area.x + 5, area.y + 5),
+        );
+        assert_eq!(picker.results.offset, 3);
+        assert_eq!(picker.selection(), Some(&8));
+
+        // Clicking entry-08 again after scrolling does not trigger a double-click.
+        let surface = frame_with_area(&mut picker, &mut app, &config, area);
+        let row_eight = (area.top()..area.bottom())
+            .find(|&row| {
+                (area.left()..area.right())
+                    .map(|column| surface[(column, row)].symbol())
+                    .collect::<String>()
+                    .contains("entry-08")
+            })
+            .unwrap();
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            scroll(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 5,
+                row_eight,
+            ),
+        );
+        assert_eq!(picker.selection(), Some(&8));
+        assert_eq!(accepted.get(), None);
         Ok(())
     }
 
