@@ -285,3 +285,59 @@ async fn manual_buffer_order_preserves_picker_mru_order() -> anyhow::Result<()> 
     f.finish().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn double_click_opens_selected_buffer() -> anyhow::Result<()> {
+    let mut f = Fixture::new(&["first.txt", "second.txt", "third.txt"])?;
+    let second = f.ids[1];
+    let current = f.current();
+    assert_ne!(current, second);
+
+    f.keys("<space>b").await?;
+    let buffer = f.app.terminal_backend().buffer();
+    let width = buffer.area.width as usize;
+    let list_width = width / 2;
+    let (column, row) = buffer
+        .content
+        .chunks(width)
+        .enumerate()
+        .find_map(|(row, cells)| {
+            let line: String = cells[..list_width]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            line.find("second.txt")
+                .map(|column| (column as u16, row as u16))
+        })
+        .expect("second.txt in buffer picker");
+
+    async fn left_click(app: &mut TestApplication, column: u16, row: u16) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        use crossterm::event::{
+            Event, KeyModifiers as Modifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        #[cfg(not(windows))]
+        use termina::event::{Event, Modifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_terminal_events(Ok(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: Modifiers::empty(),
+            })))
+            .await;
+        }
+        super::helpers::keys(app, "").await
+    }
+
+    left_click(&mut f.app, column, row).await?;
+    assert_eq!(f.current(), current);
+    left_click(&mut f.app, column, row).await?;
+    assert_eq!(f.current(), second);
+    f.finish().await;
+    Ok(())
+}

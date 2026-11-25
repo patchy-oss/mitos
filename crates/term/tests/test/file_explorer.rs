@@ -306,3 +306,92 @@ async fn parent_entry_cannot_be_moved_or_deleted_and_alt_y_yanks_paths() -> anyh
     assert_eq!(yanked, [expected.to_string_lossy().into_owned()]);
     Ok(())
 }
+
+fn picker_cell(app: &TestApplication, needle: &str) -> (u16, u16) {
+    let buffer = app.terminal_backend().buffer();
+    let width = buffer.area.width as usize;
+    let list_width = width / 2;
+    for (row, cells) in buffer.content.chunks(width).enumerate() {
+        let line: String = cells[..list_width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        if let Some(column) = line.find(needle) {
+            return (column as u16, row as u16);
+        }
+    }
+    panic!("did not find {needle:?} in picker list:\n{}", screen(app));
+}
+
+async fn left_click(app: &mut TestApplication, column: u16, row: u16) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    use crossterm::event::{
+        Event, KeyModifiers as Modifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    #[cfg(not(windows))]
+    use termina::event::{Event, Modifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_terminal_events(Ok(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: Modifiers::empty(),
+        })))
+        .await;
+    }
+    keys(app, "").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn double_click_enters_directories_and_opens_files_in_explorer_and_file_picker(
+) -> anyhow::Result<()> {
+    let (mut app, _dir, root) = explorer().await?;
+
+    // Double-clicking a directory in the file explorer enters it.
+    let (col, row) = picker_cell(&app, "sub/");
+    left_click(&mut app, col, row).await?;
+    assert!(screen(&app).contains("b.txt"), "single click should not cd");
+    left_click(&mut app, col, row).await?;
+    wait_for(&mut app, |screen| screen.contains("c.txt")).await?;
+    assert_eq!(
+        current_ref!(app.editor).1.path(),
+        Some(root.join("a.txt").as_path())
+    );
+
+    // An immediate click on the first entry (`../`) of the new directory does not cd back up.
+    let (parent_col, parent_row) = picker_cell(&app, "../");
+    left_click(&mut app, parent_col, parent_row).await?;
+    assert!(screen(&app).contains("c.txt"));
+
+    // Double-clicking a file in the explorer opens it and closes the explorer.
+    let (col, row) = picker_cell(&app, "c.txt");
+    left_click(&mut app, col, row).await?;
+    left_click(&mut app, col, row).await?;
+    assert_eq!(
+        current_ref!(app.editor).1.path(),
+        Some(root.join("sub/c.txt").as_path())
+    );
+    assert!(!screen(&app).contains("File Explorer"));
+
+    // Double-clicking a file in the file picker opens it and closes the picker.
+    app.editor.open(&root.join("a.txt"), Action::Replace)?;
+    keys(&mut app, "<space>F").await?;
+    wait_for(&mut app, |screen| screen.contains("b.txt")).await?;
+    let (col, row) = picker_cell(&app, "b.txt");
+    left_click(&mut app, col, row).await?;
+    assert_eq!(
+        current_ref!(app.editor).1.path(),
+        Some(root.join("a.txt").as_path())
+    );
+    left_click(&mut app, col, row).await?;
+    assert_eq!(
+        current_ref!(app.editor).1.path(),
+        Some(root.join("b.txt").as_path())
+    );
+    assert!(app.close().await.is_empty());
+    Ok(())
+}

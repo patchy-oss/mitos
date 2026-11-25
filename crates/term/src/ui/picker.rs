@@ -128,6 +128,7 @@ pub enum PreviewAction {
 pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
+const DOUBLE_CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn split_picker_area(area: Rect, show_preview: bool) -> (Rect, Option<Rect>) {
     if show_preview {
@@ -307,6 +308,8 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     completion_height: u16,
     /// Bounds and first match index of the rows shown in the last frame.
     rendered_results: Option<(Rect, u32)>,
+    /// Matched index and timestamp of the last left click on a result row.
+    last_click: Option<(u32, Instant)>,
 
     prompt: Prompt,
     query: PickerQuery,
@@ -468,6 +471,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             default_action: Action::Replace,
             completion_height: 0,
             rendered_results: None,
+            last_click: None,
             widths,
             preview: FilePreview::default(),
             preview_scroll: FileScroll::default(),
@@ -527,6 +531,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     /// Restoring the picker resumes its sources through their existing update path.
     pub(crate) fn suspend(&mut self) {
         self.rendered_results = None;
+        self.last_click = None;
         self.quicklist_task.cancel();
         self.query_options.needs_refresh |= self.query_options.pending.is_some()
             || (self.query_options.asynchronous.is_some() && self.results.is_refreshing())
@@ -828,6 +833,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     }
 
     fn reset_options_shared(&mut self, options: Vec<T>, editor_data: Arc<D>) {
+        self.last_click = None;
         self.results.reset(options, editor_data, &self.columns);
         self.widths = visible_column_widths(&self.columns);
         self.preview.clear();
@@ -971,6 +977,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         if self.query == old_query {
             return false;
         }
+        self.last_click = None;
         self.quicklist_task.cancel();
         if self.query_options.synchronous.is_some() {
             return true;
@@ -1466,6 +1473,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         steps: u32,
         ctx: &mut Context,
     ) -> EventResult {
+        self.execute_actions_impl(actions, steps, true, ctx)
+    }
+
+    fn execute_actions_impl(
+        &mut self,
+        actions: &[PickerAction],
+        steps: u32,
+        accept_history_completion: bool,
+        ctx: &mut Context,
+    ) -> EventResult {
         let close_fn =
             |picker: &mut Self, after| EventResult::Consumed(Some(picker.close_callback(after)));
 
@@ -1651,10 +1668,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 PickerAction::Accept => {
                     // If the prompt has a history completion and is empty, use enter to accept
                     // that completion
-                    if let Some(completion) = self
-                        .prompt
-                        .first_history_completion(ctx.editor)
-                        .filter(|_| self.prompt.line().is_empty())
+                    if accept_history_completion
+                        && let Some(completion) = self
+                            .prompt
+                            .first_history_completion(ctx.editor)
+                            .filter(|_| self.prompt.line().is_empty())
                     {
                         // The percent character is used by the query language and needs to be
                         // escaped with a backslash.
@@ -1832,6 +1850,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         let status = self.results.tick(10);
         let snapshot = self.results.matcher.snapshot();
         if status.changed {
+            self.last_click = None;
             self.results.cursor = self
                 .results
                 .cursor
@@ -1899,15 +1918,18 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         let key_event = match event {
             Event::Key(event) => {
                 self.rendered_results = None;
+                self.last_click = None;
                 *event
             }
             Event::Paste(..) => {
                 self.rendered_results = None;
+                self.last_click = None;
                 self.keys.clear();
                 return self.prompt_handle_event(event, ctx);
             }
             Event::Resize(..) => {
                 self.rendered_results = None;
+                self.last_click = None;
                 self.preview_area = None;
                 return EventResult::Consumed(None);
             }
@@ -1919,6 +1941,9 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     .preview_area
                     .is_some_and(|area| area.contains(position))
                 {
+                    if !matches!(mouse.kind, MouseEventKind::Moved) {
+                        self.last_click = None;
+                    }
                     let action = match mouse.kind {
                         MouseEventKind::ScrollDown => Some(PickerAction::PreviewScrollDown),
                         MouseEventKind::ScrollUp => Some(PickerAction::PreviewScrollUp),
@@ -1928,11 +1953,40 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                         self.rendered_results = None;
                         return self.execute_actions(&[action], ctx);
                     }
-                } else if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && let Some((area, first)) = self.rendered_results
-                    && area.contains(position)
-                {
-                    self.results.cursor = first + u32::from(mouse.row - area.y);
+                } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    if let Some((area, first)) = self.rendered_results
+                        && area.contains(position)
+                    {
+                        let index = first + u32::from(mouse.row - area.y);
+                        let now = Instant::now();
+                        let double_click = self.last_click.is_some_and(|(previous, at)| {
+                            previous == index
+                                && now.saturating_duration_since(at) <= DOUBLE_CLICK_INTERVAL
+                        });
+                        self.results.cursor = index;
+                        if double_click {
+                            self.last_click = None;
+                            if !self.replacement_visible() {
+                                self.keys.clear();
+                                self.rendered_results = None;
+                                return self.execute_actions_impl(
+                                    &[PickerAction::Accept],
+                                    1,
+                                    false,
+                                    ctx,
+                                );
+                            }
+                        } else {
+                            self.last_click = Some((index, now));
+                        }
+                    } else {
+                        self.last_click = None;
+                    }
+                } else if !matches!(
+                    mouse.kind,
+                    MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Moved
+                ) {
+                    self.last_click = None;
                 }
                 return EventResult::Consumed(None);
             }
@@ -2274,6 +2328,177 @@ mod tests {
         assert_eq!(accepted.get(), None);
         event_with_config(&mut picker, &mut app, &config, Event::Key("ret".parse()?));
         assert_eq!(accepted.get(), Some(target));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn double_click_accepts_same_row_within_interval_and_resets_otherwise(
+    ) -> anyhow::Result<()> {
+        use super::{test::*, *};
+        use std::{cell::Cell, rc::Rc, time::Duration};
+        use ui_core::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = application(false)?;
+        let config = crate::config::Config::default();
+        let accepted = Rc::new(Cell::new(None));
+        let recorded = accepted.clone();
+        let mut picker = Picker::new(
+            app.editor.redraw().clone(),
+            [
+                Column::new("name", |item: &u32, _| format!("entry-{item:02}").into()),
+                Column::new("kind", |_, _| "file".into()),
+            ],
+            0,
+            0..10,
+            (),
+            move |_, item, _| recorded.set(Some(*item)),
+        );
+        until(&mut picker, &mut app, |picker| items(picker).count() == 10).await?;
+        let area = Rect::new(3, 2, 42, 10);
+        let surface = frame_with_area(&mut picker, &mut app, &config, area);
+
+        let row_containing = |label: &str| {
+            (area.top()..area.bottom())
+                .find(|&row| {
+                    (area.left()..area.right())
+                        .map(|column| surface[(column, row)].symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .unwrap()
+        };
+        let mouse = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        let row_one = row_containing("entry-01");
+        let row_two = row_containing("entry-02");
+        let header_row = row_containing("name");
+
+        // Clicking two different rows quickly selects the second without accepting.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Down(MouseButton::Left), area.x + 5, row_one),
+        );
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Up(MouseButton::Left), area.x + 5, row_one),
+        );
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Down(MouseButton::Left), area.x + 5, row_two),
+        );
+        assert_eq!(picker.selection(), Some(&2));
+        assert_eq!(accepted.get(), None);
+
+        // Waiting past the double-click interval starts a fresh click sequence.
+        tokio::time::advance(DOUBLE_CLICK_INTERVAL + Duration::from_millis(1)).await;
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Down(MouseButton::Left), area.x + 5, row_two),
+        );
+        assert_eq!(accepted.get(), None);
+
+        // Clicking outside the result rows clears the pending click.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 5,
+                header_row,
+            ),
+        );
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Down(MouseButton::Left), area.x + 5, row_two),
+        );
+        assert_eq!(accepted.get(), None);
+
+        // Release, pointer motion, a redraw, and small horizontal drift still double-click.
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Up(MouseButton::Left), area.x + 5, row_two),
+        );
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Moved, area.x + 6, row_two),
+        );
+        frame_with_area(&mut picker, &mut app, &config, area);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        event_with_config(
+            &mut picker,
+            &mut app,
+            &config,
+            mouse(MouseEventKind::Down(MouseButton::Left), area.x + 7, row_two),
+        );
+        assert_eq!(accepted.get(), Some(2));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn double_click_accepts_row_even_with_history_completion() -> anyhow::Result<()> {
+        use super::{test::*, *};
+        use std::{cell::Cell, rc::Rc};
+        use ui_core::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = application(false)?;
+        app.editor.registers.push('/', "previous".to_owned())?;
+        let config = crate::config::Config::default();
+        let accepted = Rc::new(Cell::new(None));
+        let recorded = accepted.clone();
+        let mut picker = Picker::new(
+            app.editor.redraw().clone(),
+            [Column::new("name", |item: &u32, _| {
+                format!("entry-{item:02}").into()
+            })],
+            0,
+            0..5,
+            (),
+            move |_, item, _| recorded.set(Some(*item)),
+        )
+        .with_history_register(Some('/'));
+        until(&mut picker, &mut app, |picker| items(picker).count() == 5).await?;
+        let area = Rect::new(0, 0, 40, 10);
+        let surface = frame_with_area(&mut picker, &mut app, &config, area);
+        let row = (area.top()..area.bottom())
+            .find(|&row| {
+                (area.left()..area.right())
+                    .map(|column| surface[(column, row)].symbol())
+                    .collect::<String>()
+                    .contains("entry-03")
+            })
+            .unwrap();
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 5,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+        event_with_config(&mut picker, &mut app, &config, click.clone());
+        event_with_config(&mut picker, &mut app, &config, click);
+        assert_eq!(accepted.get(), Some(3));
+        assert!(picker.prompt.line().is_empty());
         Ok(())
     }
 

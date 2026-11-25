@@ -407,6 +407,7 @@ impl<T: Send + Sync + 'static, D: Send + Sync + 'static> Picker<T, D> {
 
     pub(super) fn publish_options(&mut self) {
         if self.results.publish() {
+            self.last_click = None;
             self.widths = visible_column_widths(&self.columns);
         }
     }
